@@ -1,0 +1,8 @@
+pyrofork
+tgcrypto
+motor
+beautifulsoup4
+requests
+python-dotenv
+aiohttp
+aiofiles
