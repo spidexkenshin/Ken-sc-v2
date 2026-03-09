@@ -2,54 +2,48 @@ import os
 import re
 import asyncio
 import aiohttp
-import requests
+import json
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, unquote
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from pyrogram.errors import UserNotParticipant, ChatWriteForbidden
-from pymongo import MongoClient
 from datetime import datetime
-import json
 import logging
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Config
+# Config - Directly yahan se le raha hu, Railway variables bhi support karega
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "8562237682:AAEJCVtlLNFuteUUTnTphORPKHwRPweiHcY")
     API_ID = int(os.getenv("API_ID", "37407868"))
     API_HASH = os.getenv("API_HASH", "d7d3bff9f7cf9f3b111129bdbd13a065")
-    MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://iamnotmohit1_db_user:<iammohitgurjar.1>@kenshindb.esj4x5f.mongodb.net/?appName=KENSHINDB")
     ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "6728678197").split(",")))
     
-    # Anime Websites List
+    # Target Websites (Real-time scraping)
     SITES = {
-        "desidubanime": "https://desidubanime.me",
-        "animesalt": "https://animesalt.top",
-        "animedubhindi": "https://animedubhindi.me",
-        "animehindidubbed": "https://animehindidubbed.in",
-        "animedekho": "https://animedekho.co.in",
-        "primeilx": "https://primeilx.com",
-        "hindianime": "https://hindianime.in",
-        "animelok": "https://animelok.site",
-        "dailyanime": "https://dailyanime.site",
-        "animekai": "https://animekai.to",
-        "gogoanime": "https://gogoanime3.co",
-        "9anime": "https://9anime.to",
-        "hianime": "https://hianime.to",
-        "animepahe": "https://animepahe.ru",
-        "zoro": "https://zoro.to"
+        "desidubanime": {
+            "url": "https://desidubanime.me",
+            "search_path": "/?s={query}",
+            "name": "DesiDubAnime"
+        },
+        "animesalt": {
+            "url": "https://animesalt.top",
+            "search_path": "/search?q={query}",
+            "name": "AnimeSalt"
+        },
+        "animedubhindi": {
+            "url": "https://animedubhindi.me",
+            "search_path": "/?s={query}",
+            "name": "AnimeDubHindi"
+        },
+        "animehindidubbed": {
+            "url": "https://animehindidubbed.in",
+            "search_path": "/?s={query}",
+            "name": "AnimeHindiDubbed"
+        }
     }
-
-# Database Setup
-client = MongoClient(Config.MONGO_URI)
-db = client.anime_bot
-users_col = db.users
-settings_col = db.settings
-admins_col = db.admins
 
 # Initialize Bot
 app = Client(
@@ -61,319 +55,586 @@ app = Client(
     parse_mode=enums.ParseMode.HTML
 )
 
-# Helper Functions
+# In-memory storage (No MongoDB needed)
+user_sessions = {}
+search_cache = {}
+settings = {
+    "caption": "🎬 <b>{title}</b>\n📺 Episode: {episode}\n🌐 Source: {source}\n🔰 Quality: {quality}\n\n⚡ Join @yourchannel",
+    "thumbnail": None,
+    "filename": "{title}_EP{episode}_{quality}"
+}
+
 def is_admin(user_id: int) -> bool:
-    return user_id in Config.ADMIN_IDS or admins_col.find_one({"user_id": user_id}) is not None
+    return user_id in Config.ADMIN_IDS
 
-def get_settings():
-    settings = settings_col.find_one({"_id": "global"})
-    if not settings:
-        default = {
-            "_id": "global",
-            "caption": "🎬 <b>{title}</b>\n\n📺 Quality: {quality}\n🌐 Source: {source}\n\n➡️ Join @yourchannel",
-            "thumbnail": None,
-            "filename_template": "{title}_EP{ep}_{quality}"
-        }
-        settings_col.insert_one(default)
-        return default
-    return settings
+# ============== REAL-TIME SCRAPING FUNCTIONS ==============
 
-async def search_anime(query: str):
-    """Search anime across multiple sites"""
-    results = []
+async def fetch_page(url, headers=None, timeout=15):
+    """Generic page fetcher with error handling"""
+    default_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
     
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        
-        # DesiDubAnime Search
-        try:
-            url = f"{Config.SITES['desidubanime']}/?s={quote(query)}"
-            tasks.append(fetch_site(session, url, "desidubanime", query))
-        except:
-            pass
-            
-        # AnimeSalt Search
-        try:
-            url = f"{Config.SITES['animesalt']}/search?q={quote(query)}"
-            tasks.append(fetch_site(session, url, "animesalt", query))
-        except:
-            pass
-            
-        # GogoAnime Search
-        try:
-            url = f"{Config.SITES['gogoanime']}/search.html?keyword={quote(query)}"
-            tasks.append(fetch_site(session, url, "gogoanime", query))
-        except:
-            pass
-            
-        # HiAnime Search
-        try:
-            url = f"{Config.SITES['hianime']}/search?keyword={quote(query)}"
-            tasks.append(fetch_site(session, url, "hianime", query))
-        except:
-            pass
-            
-        # AnimePahe Search
-        try:
-            url = f"{Config.SITES['animepahe']}/api?m=search&q={quote(query)}"
-            tasks.append(fetch_site(session, url, "animepahe", query))
-        except:
-            pass
-        
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for resp in responses:
-            if isinstance(resp, list):
-                results.extend(resp)
-            elif isinstance(resp, dict) and 'results' in resp:
-                results.extend(resp['results'])
-                
-    return results
-
-async def fetch_site(session, url, site_name, query):
-    """Fetch and parse individual sites"""
+    if headers:
+        default_headers.update(headers)
+    
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=default_headers, timeout=timeout, ssl=False) as response:
+                if response.status == 200:
+                    return await response.text()
+                else:
+                    logger.error(f"HTTP {response.status} for {url}")
+                    return None
+    except Exception as e:
+        logger.error(f"Fetch error for {url}: {e}")
+        return None
+
+async def search_desidubanime(query):
+    """Search DesiDubAnime.me"""
+    try:
+        search_url = f"{Config.SITES['desidubanime']['url']}/?s={quote(query)}"
+        html = await fetch_page(search_url)
+        if not html:
+            return []
         
-        async with session.get(url, headers=headers, timeout=10) as response:
-            if response.status != 200:
-                return []
+        soup = BeautifulSoup(html, 'html.parser')
+        results = []
+        
+        # Try multiple selectors
+        items = soup.find_all('div', class_='bsx') or \
+                soup.find_all('article', class_='bsx') or \
+                soup.find_all('div', class_='tt') or \
+                soup.select('.listupd .bsx') or \
+                soup.find_all('a', class_='tip')
+        
+        for item in items[:8]:
+            try:
+                # Extract link
+                link_tag = item if item.name == 'a' else item.find('a', href=True)
+                if not link_tag:
+                    continue
                 
-            html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            results = []
-            
-            if site_name == "desidubanime":
-                items = soup.find_all('div', class_='bsx') or soup.find_all('article')
-                for item in items[:5]:
-                    try:
-                        title = item.find('h2') or item.find('a', class_='tip')
-                        if title:
-                            title_text = title.get_text(strip=True)
-                            link = title.get('href') if title.name == 'a' else item.find('a').get('href')
-                            img = item.find('img')
-                            thumb = img.get('src') if img else None
-                            
-                            results.append({
-                                'title': title_text,
-                                'url': link if link.startswith('http') else urljoin(Config.SITES['desidubanime'], link),
-                                'site': 'DesiDubAnime',
-                                'language': 'Hindi Dubbed',
-                                'thumbnail': thumb
-                            })
-                    except:
-                        continue
-                        
-            elif site_name == "gogoanime":
-                items = soup.find_all('p', class_='name') or soup.find_all('div', class_='img')
-                for item in items[:5]:
-                    try:
-                        a_tag = item.find('a') if item.name != 'a' else item
-                        title = a_tag.get('title') or a_tag.get_text(strip=True)
-                        link = a_tag.get('href')
-                        
-                        results.append({
-                            'title': title,
-                            'url': urljoin(Config.SITES['gogoanime'], link),
-                            'site': 'GogoAnime',
-                            'language': 'Sub/Dub',
-                            'thumbnail': None
-                        })
-                    except:
-                        continue
-                        
-            elif site_name == "hianime":
-                items = soup.find_all('div', class_='film-detail') or soup.find_all('a', class_='film-poster')
-                for item in items[:5]:
-                    try:
-                        a_tag = item if item.name == 'a' else item.find('a')
-                        title = a_tag.get('title') or a_tag.get('data-title')
-                        link = a_tag.get('href')
-                        img = a_tag.find('img')
-                        
-                        results.append({
-                            'title': title,
-                            'url': urljoin(Config.SITES['hianime'], link),
-                            'site': 'HiAnime',
-                            'language': 'Sub/Dub',
-                            'thumbnail': img.get('data-src') if img else None
-                        })
-                    except:
-                        continue
-                        
-            elif site_name == "animepahe":
+                link = link_tag.get('href')
+                if not link:
+                    continue
+                
+                # Full URL
+                if not link.startswith('http'):
+                    link = urljoin(Config.SITES['desidubanime']['url'], link)
+                
+                # Extract title
+                title_tag = item.find('h2') or item.find('div', class_='tt') or item.find('img', alt=True)
+                title = ""
+                if title_tag:
+                    if title_tag.name == 'img':
+                        title = title_tag.get('alt', '')
+                    else:
+                        title = title_tag.get_text(strip=True)
+                
+                if not title and link_tag.get('title'):
+                    title = link_tag.get('title')
+                
+                # Extract thumbnail
+                img = item.find('img')
+                thumb = None
+                if img:
+                    thumb = img.get('data-src') or img.get('src') or img.get('data-lazy-src')
+                
+                # Extract type/language info
+                type_tag = item.find('span', class_='type') or item.find('div', class_='type')
+                lang = "Hindi Dubbed"
+                if type_tag:
+                    type_text = type_tag.get_text(strip=True).lower()
+                    if 'sub' in type_text:
+                        lang = "Subbed"
+                    elif 'dub' in type_text:
+                        lang = "Dubbed"
+                
+                if title and link:
+                    results.append({
+                        'title': title,
+                        'url': link,
+                        'site': 'DesiDubAnime',
+                        'language': lang,
+                        'thumbnail': thumb,
+                        'type': 'TV Series'
+                    })
+            except Exception as e:
+                continue
+                
+        return results
+    except Exception as e:
+        logger.error(f"DesiDubAnime search error: {e}")
+        return []
+
+async def search_animesalt(query):
+    """Search AnimeSalt.top"""
+    try:
+        search_url = f"{Config.SITES['animesalt']['url']}/search?q={quote(query)}"
+        html = await fetch_page(search_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        results = []
+        
+        # AnimeSalt specific selectors
+        items = soup.find_all('div', class_='anime-item') or \
+                soup.find_all('div', class_='item') or \
+                soup.find_all('article') or \
+                soup.select('.anime-list .item')
+        
+        for item in items[:8]:
+            try:
+                link_tag = item.find('a', href=True)
+                if not link_tag:
+                    continue
+                
+                link = link_tag.get('href')
+                if not link.startswith('http'):
+                    link = urljoin(Config.SITES['animesalt']['url'], link)
+                
+                title_tag = item.find('h3') or item.find('h4') or item.find('div', class_='title') or item.find('img', alt=True)
+                title = ""
+                if title_tag:
+                    if title_tag.name == 'img':
+                        title = title_tag.get('alt', '')
+                    else:
+                        title = title_tag.get_text(strip=True)
+                
+                img = item.find('img')
+                thumb = None
+                if img:
+                    thumb = img.get('data-src') or img.get('src')
+                
+                # Check for Hindi tag
+                tags = item.find_all('span', class_='badge') or item.find_all('div', class_='tag')
+                lang = "Hindi Dubbed"
+                for tag in tags:
+                    tag_text = tag.get_text(strip=True).lower()
+                    if 'hindi' in tag_text:
+                        lang = "Hindi Dubbed"
+                        break
+                    elif 'sub' in tag_text:
+                        lang = "Subbed"
+                
+                if title and link:
+                    results.append({
+                        'title': title,
+                        'url': link,
+                        'site': 'AnimeSalt',
+                        'language': lang,
+                        'thumbnail': thumb,
+                        'type': 'Anime'
+                    })
+            except Exception as e:
+                continue
+                
+        return results
+    except Exception as e:
+        logger.error(f"AnimeSalt search error: {e}")
+        return []
+
+async def search_animedubhindi(query):
+    """Search AnimeDubHindi.me"""
+    try:
+        search_url = f"{Config.SITES['animedubhindi']['url']}/?s={quote(query)}"
+        html = await fetch_page(search_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        results = []
+        
+        items = soup.find_all('div', class_='bsx') or \
+                soup.find_all('article') or \
+                soup.select('.listupd article')
+        
+        for item in items[:8]:
+            try:
+                link_tag = item.find('a', href=True)
+                if not link_tag:
+                    continue
+                
+                link = link_tag.get('href')
+                if not link.startswith('http'):
+                    link = urljoin(Config.SITES['animedubhindi']['url'], link)
+                
+                title = ""
+                title_tag = item.find('h2') or item.find('div', class_='tt') or item.find('img', alt=True)
+                if title_tag:
+                    if title_tag.name == 'img':
+                        title = title_tag.get('alt', '')
+                    else:
+                        title = title_tag.get_text(strip=True)
+                
+                img = item.find('img')
+                thumb = img.get('data-src') or img.get('src') if img else None
+                
+                # Language detection
+                lang_tag = item.find('span', class_='sb') or item.find('div', class_='type')
+                lang = "Hindi Dubbed"
+                if lang_tag:
+                    lang_text = lang_tag.get_text(strip=True).lower()
+                    if 'hindi' in lang_text or 'dub' in lang_text:
+                        lang = "Hindi Dubbed"
+                
+                if title and link:
+                    results.append({
+                        'title': title,
+                        'url': link,
+                        'site': 'AnimeDubHindi',
+                        'language': lang,
+                        'thumbnail': thumb,
+                        'type': 'Series'
+                    })
+            except Exception as e:
+                continue
+                
+        return results
+    except Exception as e:
+        logger.error(f"AnimeDubHindi search error: {e}")
+        return []
+
+async def search_animehindidubbed(query):
+    """Search AnimeHindiDubbed.in"""
+    try:
+        search_url = f"{Config.SITES['animehindidubbed']['url']}/?s={quote(query)}"
+        html = await fetch_page(search_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        results = []
+        
+        items = soup.find_all('div', class_='bsx') or \
+                soup.find_all('article', class_='bsx') or \
+                soup.select('.listupd .bsx')
+        
+        for item in items[:8]:
+            try:
+                link_tag = item.find('a', href=True)
+                if not link_tag:
+                    continue
+                
+                link = link_tag.get('href')
+                if not link.startswith('http'):
+                    link = urljoin(Config.SITES['animehindidubbed']['url'], link)
+                
+                title_tag = item.find('h2') or item.find('div', class_='tt') or item.find('img', alt=True)
+                title = ""
+                if title_tag:
+                    if title_tag.name == 'img':
+                        title = title_tag.get('alt', '')
+                    else:
+                        title = title_tag.get_text(strip=True)
+                
+                img = item.find('img')
+                thumb = img.get('data-src') or img.get('src') if img else None
+                
+                status_tag = item.find('div', class_='status') or item.find('span', class_='status')
+                lang = "Hindi Dubbed"
+                if status_tag:
+                    status_text = status_tag.get_text(strip=True).lower()
+                    if 'dubbed' in status_text or 'hindi' in status_text:
+                        lang = "Hindi Dubbed"
+                
+                if title and link:
+                    results.append({
+                        'title': title,
+                        'url': link,
+                        'site': 'AnimeHindiDubbed',
+                        'language': lang,
+                        'thumbnail': thumb,
+                        'type': 'Anime'
+                    })
+            except Exception as e:
+                continue
+                
+        return results
+    except Exception as e:
+        logger.error(f"AnimeHindiDubbed search error: {e}")
+        return []
+
+async def search_all_sites(query):
+    """Search all sites concurrently"""
+    tasks = [
+        search_desidubanime(query),
+        search_animesalt(query),
+        search_animedubhindi(query),
+        search_animehindidubbed(query)
+    ]
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_results = []
+    
+    for result in results:
+        if isinstance(result, list):
+            all_results.extend(result)
+        elif isinstance(result, Exception):
+            logger.error(f"Search task failed: {result}")
+    
+    return all_results
+
+# ============== EPISODE & VIDEO EXTRACTION ==============
+
+async def get_episodes_desidubanime(anime_url):
+    """Extract episodes from DesiDubAnime"""
+    try:
+        html = await fetch_page(anime_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        episodes = []
+        
+        # Method 1: Eplister (standard WordPress anime theme)
+        ep_list = soup.find('div', class_='eplister') or soup.find('div', id='episodes')
+        if ep_list:
+            items = ep_list.find_all('a') or ep_list.find_all('div', class_='epl-item')
+            for item in items:
                 try:
-                    data = json.loads(html)
-                    for item in data.get('data', [])[:5]:
-                        results.append({
-                            'title': item.get('title'),
-                            'url': f"{Config.SITES['animepahe']}/anime/{item.get('session')}",
-                            'site': 'AnimePahe',
-                            'language': 'Sub',
-                            'thumbnail': item.get('poster')
+                    ep_num = ""
+                    ep_title = ""
+                    
+                    num_tag = item.find('div', class_='epl-num') or item.find('span', class_='num')
+                    if num_tag:
+                        ep_num = num_tag.get_text(strip=True)
+                    
+                    title_tag = item.find('div', class_='epl-title') or item.find('span', class_='title')
+                    if title_tag:
+                        ep_title = title_tag.get_text(strip=True)
+                    
+                    link = item.get('href') if item.name == 'a' else item.find('a', href=True)
+                    if link:
+                        if isinstance(link, str):
+                            ep_link = link
+                        else:
+                            ep_link = link.get('href')
+                        
+                        if ep_link and not ep_link.startswith('http'):
+                            ep_link = urljoin(anime_url, ep_link)
+                        
+                        episodes.append({
+                            'number': ep_num or str(len(episodes) + 1),
+                            'title': ep_title or f"Episode {ep_num or len(episodes) + 1}",
+                            'url': ep_link
                         })
                 except:
-                    pass
-            
-            return results
-            
-    except Exception as e:
-        logger.error(f"Error fetching {site_name}: {e}")
-        return []
-
-async def get_episodes(anime_url, site):
-    """Get episodes list from anime page"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+                    continue
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(anime_url, headers=headers, timeout=10) as response:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                episodes = []
-                
-                if "desidubanime" in site.lower():
-                    # Try to find episode list
-                    ep_list = soup.find('div', class_='eplister') or soup.find('div', id='episode')
-                    if ep_list:
-                        items = ep_list.find_all('a') or ep_list.find_all('div', class_='episodiotitle')
-                        for i, item in enumerate(items, 1):
-                            try:
-                                ep_num = item.find('div', class_='epl-num') or item.find('span')
-                                ep_title = item.find('div', class_='epl-title') or item
-                                ep_link = item.get('href') if item.name == 'a' else item.find('a').get('href')
-                                
-                                episodes.append({
-                                    'number': ep_num.get_text(strip=True) if ep_num else str(i),
-                                    'title': ep_title.get_text(strip=True) if ep_title else f"Episode {i}",
-                                    'url': ep_link if ep_link.startswith('http') else urljoin(anime_url, ep_link)
-                                })
-                            except:
-                                continue
-                                
-                elif "gogoanime" in site.lower():
-                    ep_start = soup.find('input', {'id': 'episode_page'})
-                    if ep_start:
-                        ep_start = ep_start.get('ep_start', '0')
-                        ep_end = soup.find('input', {'id': 'episode_page'}).get('ep_end', '0')
-                        
-                        for i in range(int(ep_start), int(ep_end)+1):
-                            episodes.append({
-                                'number': str(i),
-                                'title': f"Episode {i}",
-                                'url': anime_url.replace('/category/', '/') + f"-episode-{i}"
-                            })
-                            
-                elif "hianime" in site.lower():
-                    items = soup.find_all('a', {'data-id': True})
-                    for item in items:
-                        try:
-                            ep_num = item.find('div', class_='episode-number') or item.get('data-number')
-                            episodes.append({
-                                'number': str(ep_num) if ep_num else item.get('data-id'),
-                                'title': f"Episode {ep_num}" if ep_num else f"EP {item.get('data-id')}",
-                                'url': urljoin(anime_url, item.get('href', ''))
-                            })
-                        except:
-                            continue
-                
-                return episodes
-                
-    except Exception as e:
-        logger.error(f"Error getting episodes: {e}")
-        return []
-
-async def get_download_links(episode_url, site):
-    """Get download links for specific episode"""
-    qualities = []
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(episode_url, headers=headers, timeout=10) as response:
-                html = await response.text()
-                
-                # This is a simplified version - real implementation would need specific parsers
-                # for each site's video extraction logic
-                
-                if "desidubanime" in site.lower():
-                    # Look for video sources
-                    soup = BeautifulSoup(html, 'html.parser')
-                    iframe = soup.find('iframe')
-                    if iframe:
-                        src = iframe.get('src')
-                        qualities.append({
-                            'quality': 'HD',
-                            'url': src,
-                            'size': 'Unknown'
-                        })
-                        
-                elif "gogoanime" in site.lower():
-                    # Extract streaming links
-                    match = re.search(r"iframe src=\"([^\"]+)\"", html)
+        # Method 2: Alternative selectors
+        if not episodes:
+            items = soup.select('.episodelist a') or soup.find_all('a', href=re.compile(r'episode-\d+'))
+            for item in items:
+                try:
+                    href = item.get('href', '')
+                    match = re.search(r'episode-(\d+)', href, re.I)
                     if match:
-                        qualities.append({
-                            'quality': 'Auto',
-                            'url': match.group(1),
-                            'size': 'Unknown'
+                        ep_num = match.group(1)
+                        episodes.append({
+                            'number': ep_num,
+                            'title': f"Episode {ep_num}",
+                            'url': href if href.startswith('http') else urljoin(anime_url, href)
                         })
-                
-                # Add default qualities for demo
-                if not qualities:
-                    qualities = [
-                        {'quality': '360p', 'url': episode_url, 'size': '~150MB'},
-                        {'quality': '480p', 'url': episode_url, 'size': '~250MB'},
-                        {'quality': '720p', 'url': episode_url, 'size': '~400MB'},
-                        {'quality': '1080p', 'url': episode_url, 'size': '~800MB'}
-                    ]
-                    
+                except:
+                    continue
+        
+        return episodes[::-1]  # Reverse to get EP1 first
     except Exception as e:
-        logger.error(f"Error getting download links: {e}")
-        qualities = [
-            {'quality': '360p', 'url': episode_url, 'size': 'N/A'},
-            {'quality': '480p', 'url': episode_url, 'size': 'N/A'},
-            {'quality': '720p', 'url': episode_url, 'size': 'N/A'}
+        logger.error(f"Get episodes error: {e}")
+        return []
+
+async def get_episodes_animesalt(anime_url):
+    """Extract episodes from AnimeSalt"""
+    try:
+        html = await fetch_page(anime_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        episodes = []
+        
+        # Common AnimeSalt structure
+        items = soup.find_all('div', class_='episode-item') or \
+                soup.find_all('a', class_='episode-link') or \
+                soup.select('.episode-list a')
+        
+        for item in items:
+            try:
+                link = item.get('href') if item.name == 'a' else item.find('a', href=True)
+                if not link:
+                    continue
+                
+                if isinstance(link, str):
+                    ep_link = link
+                else:
+                    ep_link = link.get('href')
+                
+                if not ep_link.startswith('http'):
+                    ep_link = urljoin(anime_url, ep_link)
+                
+                # Extract episode number
+                ep_num = ""
+                num_tag = item.find('div', class_='ep-number') or item.find('span', class_='number')
+                if num_tag:
+                    ep_num = num_tag.get_text(strip=True)
+                else:
+                    match = re.search(r'episode[/_-]?(\d+)', ep_link, re.I)
+                    if match:
+                        ep_num = match.group(1)
+                
+                title = item.get_text(strip=True) or f"Episode {ep_num}"
+                
+                if ep_num:
+                    episodes.append({
+                        'number': ep_num,
+                        'title': title,
+                        'url': ep_link
+                    })
+            except:
+                continue
+        
+        return episodes
+    except Exception as e:
+        logger.error(f"AnimeSalt episodes error: {e}")
+        return []
+
+async def get_video_links(episode_url, site_name):
+    """Extract direct video/streaming links from episode page"""
+    try:
+        html = await fetch_page(episode_url)
+        if not html:
+            return []
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        qualities = []
+        
+        # Method 1: Find iframe (embedded players)
+        iframe = soup.find('iframe', src=True)
+        if iframe:
+            src = iframe.get('src')
+            if src:
+                qualities.append({
+                    'quality': 'Stream',
+                    'url': src if src.startswith('http') else urljoin(episode_url, src),
+                    'type': 'embed'
+                })
+        
+        # Method 2: Find video tags
+        video = soup.find('video', src=True) or soup.find('video')
+        if video:
+            src = video.get('src')
+            if src:
+                qualities.append({
+                    'quality': 'Direct',
+                    'url': urljoin(episode_url, src),
+                    'type': 'direct'
+                })
+            
+            # Check sources
+            sources = video.find_all('source')
+            for source in sources:
+                src = source.get('src')
+                res = source.get('res', '') or source.get('label', '') or source.get('title', '')
+                if src:
+                    qualities.append({
+                        'quality': res or 'Auto',
+                        'url': urljoin(episode_url, src),
+                        'type': 'direct'
+                    })
+        
+        # Method 3: Find download links
+        download_div = soup.find('div', class_='download') or soup.find('div', id='download')
+        if download_div:
+            links = download_div.find_all('a', href=True)
+            for link in links:
+                try:
+                    href = link.get('href')
+                    text = link.get_text(strip=True)
+                    
+                    # Extract quality from text
+                    quality = 'Unknown'
+                    if '1080' in text:
+                        quality = '1080p'
+                    elif '720' in text:
+                        quality = '720p'
+                    elif '480' in text:
+                        quality = '480p'
+                    elif '360' in text:
+                        quality = '360p'
+                    elif '240' in text:
+                        quality = '240p'
+                    
+                    if href and not href.startswith('javascript'):
+                        qualities.append({
+                            'quality': quality,
+                            'url': href if href.startswith('http') else urljoin(episode_url, href),
+                            'type': 'download'
+                        })
+                except:
+                    continue
+        
+        # Method 4: Regex patterns for common video hosts
+        patterns = [
+            r'(https?://[^\s"\'<>]+\.mp4)',
+            r'(https?://[^\s"\'<>]*stream[^\s"\'<>]*)',
+            r'(https?://[^\s"\'<>]*video[^\s"\'<>]*)',
         ]
         
-    return qualities
+        for pattern in patterns:
+            matches = re.findall(pattern, html)
+            for match in matches[:3]:  # Limit to avoid duplicates
+                if match not in [q['url'] for q in qualities]:
+                    qualities.append({
+                        'quality': 'Auto',
+                        'url': match,
+                        'type': 'regex'
+                    })
+        
+        # If nothing found, return placeholder for manual inspection
+        if not qualities:
+            qualities.append({
+                'quality': 'Visit Site',
+                'url': episode_url,
+                'type': 'manual'
+            })
+        
+        return qualities
+    except Exception as e:
+        logger.error(f"Video extraction error: {e}")
+        return [{'quality': 'Error', 'url': episode_url, 'type': 'error'}]
 
-# Command Handlers
+# ============== BOT HANDLERS ==============
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message: Message):
     user_id = message.from_user.id
     
-    # Add user to database
-    if not users_col.find_one({"user_id": user_id}):
-        users_col.insert_one({
-            "user_id": user_id,
-            "username": message.from_user.username,
-            "joined": datetime.now()
-        })
-    
     welcome_text = f"""
 👋 <b>Welcome {message.from_user.mention}!</b>
 
-🤖 <b>Anime Scraper Bot</b> - Your ultimate anime downloading companion!
+🤖 <b>Anime Scraper Bot Pro</b> - Real-time Hindi Anime Downloader!
 
 ✨ <b>Features:</b>
-• Search anime from 15+ websites
-• Hindi Dubbed & Subbed content
-• Multiple quality options (360p to 1080p)
-• Batch download support
-• Custom captions & thumbnails
+• 🔍 Search from 4+ Hindi Anime Sites
+• ⚡ Real-time scraping (No Database)
+• 🎬 Direct Video Links
+• 📥 Multiple Quality Options
+• 🇮🇳 Hindi Dubbed Focus
 
 📝 <b>Commands:</b>
-/search <name> - Search anime
+/search <name> - Search anime (e.g., /search Solo Leveling)
 /help - Show help
-/settings - Bot settings (Admin only)
+/about - Bot info
 
-🔰 <b>Status:</b> {'✅ Admin' if is_admin(user_id) else '👤 User'}
+🔰 <b>Status:</b> {'👑 Owner' if user_id in Config.ADMIN_IDS else '👤 User'}
     """
     
     await message.reply_text(welcome_text, disable_web_page_preview=True)
@@ -381,135 +642,220 @@ async def start_handler(client, message: Message):
 @app.on_message(filters.command("help"))
 async def help_handler(client, message: Message):
     help_text = """
-📚 <b>Bot Commands Guide</b>
+📚 <b>Bot Commands</b>
 
 <b>User Commands:</b>
-/start - Start the bot
-/search <anime name> - Search for anime
-/help - Show this message
+/start - Start bot
+/search <anime name> - Search across all sites
+/help - This message
+/about - Bot information
 
-<b>Admin Commands:</b>
-/addadmin <user_id> - Add new admin
-/deladmin <user_id> - Remove admin
-/admins - List all admins
-/setcaption <text> - Set custom caption
-/setthumbnail - Set thumbnail (reply to photo)
-/setfilename <template> - Set filename format
-/broadcast <message> - Send message to all users
-/stats - Show bot statistics
+<b>How to Use:</b>
+1. Send /search followed by anime name
+2. Click on desired result
+3. Select Episode or Download All
+4. Choose Quality
+5. Get Direct Link!
 
-<b>Caption Variables:</b>
-{title} - Anime title
-{quality} - Video quality
-{episode} - Episode number
-{season} - Season number
-{source} - Website source
+<b>Supported Sites:</b>
+• DesiDubAnime.me
+• AnimeSalt.top  
+• AnimeDubHindi.me
+• AnimeHindiDubbed.in
 
-<b>Filename Variables:</b>
-{title} - Anime title
-{ep} - Episode number
-{quality} - Quality (360p, 720p, etc.)
+⚠️ <b>Note:</b> Links are scraped in real-time. If site is down, search may fail.
     """
     await message.reply_text(help_text)
+
+@app.on_message(filters.command("about"))
+async def about_handler(client, message: Message):
+    await message.reply_text("""
+🤖 <b>Anime Scraper Bot Pro</b>
+
+🛠 <b>Version:</b> 2.0
+⚡ <b>Engine:</b> Real-time Scraping
+💾 <b>Storage:</b> In-Memory (No DB)
+🐍 <b>Python:</b> 3.11+ Compatible
+
+👑 <b>Admin:</b> @yourusername
+📢 <b>Channel:</b> @yourchannel
+
+<b>Credits:</b>
+• Pyrogram
+• BeautifulSoup4
+• aiohttp
+    """)
 
 @app.on_message(filters.command("search"))
 async def search_handler(client, message: Message):
     if len(message.command) < 2:
-        return await message.reply_text("❌ Please provide anime name!\n\nUsage: `/search Solo Leveling`")
+        return await message.reply_text(
+            "❌ <b>Usage:</b> <code>/search anime name</code>\n\n"
+            "Example: <code>/search Solo Leveling</code>\n"
+            "Example: <code>/search Demon Slayer</code>",
+            quote=True
+        )
     
     query = " ".join(message.command[1:])
-    status_msg = await message.reply_text(f"🔍 Searching for: <b>{query}</b>\n\n⏳ Please wait...")
+    
+    # Check cache first (5 min cache)
+    cache_key = f"{message.from_user.id}:{query.lower()}"
+    current_time = datetime.now().timestamp()
+    
+    if cache_key in search_cache:
+        cached_data, cached_time = search_cache[cache_key]
+        if current_time - cached_time < 300:  # 5 minutes
+            return await display_results(message, cached_data, query, cache_key)
+    
+    status_msg = await message.reply_text(
+        f"🔍 <b>Searching for:</b> <code>{query}</code>\n\n"
+        f"⏳ Searching DesiDubAnime.me...\n"
+        f"⏳ Searching AnimeSalt.top...\n"
+        f"⏳ Searching AnimeDubHindi.me...\n"
+        f"⏳ Searching AnimeHindiDubbed.in...\n\n"
+        f"<i>Please wait 10-15 seconds...</i>",
+        quote=True
+    )
     
     try:
-        results = await search_anime(query)
+        # Search all sites
+        results = await search_all_sites(query)
         
         if not results:
-            return await status_msg.edit_text("❌ No results found! Try different keywords.")
+            return await status_msg.edit_text(
+                f"❌ <b>No results found for:</b> <code>{query}</code>\n\n"
+                f"💡 <b>Tips:</b>\n"
+                f"• Check spelling\n"
+                f"• Try shorter names (e.g., 'Demon Slayer' instead of 'Demon Slayer: Kimetsu no Yaiba')\n"
+                f"• Try English names\n"
+                f"• Sites might be temporarily down"
+            )
         
-        # Group by site
-        sites_found = {}
-        for res in results:
-            site = res['site']
-            if site not in sites_found:
-                sites_found[site] = []
-            sites_found[site].append(res)
+        # Store in cache
+        search_cache[cache_key] = (results, current_time)
         
-        text = f"🎯 <b>Search Results for:</b> <code>{query}</code>\n\n"
-        text += f"📊 <b>Found:</b> {len(results)} results from {len(sites_found)} sources\n\n"
+        # Store in session for callbacks
+        user_sessions[message.from_user.id] = {
+            'results': results,
+            'query': query,
+            'timestamp': current_time
+        }
         
-        keyboard = []
-        
-        for idx, result in enumerate(results[:10], 1):
-            lang = result.get('language', 'Unknown')
-            site = result['site']
-            text += f"{idx}. <b>{result['title']}</b>\n"
-            text += f"   🌐 {site} | 🗣 {lang}\n\n"
-            
-            keyboard.append([InlineKeyboardButton(
-                f"📥 {idx}. {result['title'][:30]}... [{site}]",
-                callback_data=f"select_{idx}_{message.id}"
-            )])
-            
-        # Store results in memory for callback
-        app.search_results = getattr(app, 'search_results', {})
-        app.search_results[message.id] = results[:10]
-        
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_search")])
-        
-        await status_msg.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_web_page_preview=True
-        )
+        await display_results(message, results, query, cache_key, status_msg)
         
     except Exception as e:
         logger.error(f"Search error: {e}")
         await status_msg.edit_text(f"❌ Error occurred: {str(e)}")
 
-@app.on_callback_query(filters.regex(r"^select_(\d+)_(\d+)$"))
-async def select_anime_callback(client, callback: CallbackQuery):
-    idx = int(callback.matches[0].group(1))
-    msg_id = int(callback.matches[0].group(2))
+async def display_results(message, results, query, cache_key, status_msg=None):
+    """Display search results with inline buttons"""
     
-    results = getattr(app, 'search_results', {}).get(msg_id, [])
-    if not results or idx > len(results):
+    # Group by site
+    sites_count = {}
+    for r in results:
+        site = r['site']
+        sites_count[site] = sites_count.get(site, 0) + 1
+    
+    text = f"🎯 <b>Search Results:</b> <code>{query}</code>\n\n"
+    text += f"📊 <b>Found {len(results)} results</b>\n"
+    text += "├─ " + "\n├─ ".join([f"<b>{site}:</b> {count}" for site, count in sites_count.items()])
+    text += "\n\n<b>Select an anime:</b>\n\n"
+    
+    keyboard = []
+    
+    for idx, result in enumerate(results[:10], 1):
+        emoji = "🎬" if "movie" in result.get('type', '').lower() else "📺"
+        lang_emoji = "🇮🇳" if "hindi" in result['language'].lower() else "🇯🇵"
+        
+        text += f"{idx}. {emoji} <b>{result['title']}</b>\n"
+        text += f"   └─ 🌐 {result['site']} | {lang_emoji} {result['language']}\n\n"
+        
+        keyboard.append([InlineKeyboardButton(
+            f"{idx}. {result['title'][:35]}{'...' if len(result['title']) > 35 else ''}",
+            callback_data=f"anime_{message.from_user.id}_{idx-1}"
+        )])
+    
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{cache_key}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{message.from_user.id}")
+    ])
+    
+    if status_msg:
+        await status_msg.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+    else:
+        await message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+
+@app.on_callback_query(filters.regex(r"^anime_(\d+)_(\d+)$"))
+async def anime_selected_callback(client, callback: CallbackQuery):
+    user_id = int(callback.matches[0].group(1))
+    idx = int(callback.matches[0].group(2))
+    
+    if user_id != callback.from_user.id:
+        return await callback.answer("❌ This is not your search!", show_alert=True)
+    
+    session = user_sessions.get(user_id)
+    if not session:
         return await callback.answer("❌ Session expired! Search again.", show_alert=True)
     
-    anime = results[idx-1]
+    results = session.get('results', [])
+    if idx >= len(results):
+        return await callback.answer("❌ Invalid selection!", show_alert=True)
+    
+    anime = results[idx]
     
     await callback.message.edit_text(
         f"🎬 <b>{anime['title']}</b>\n\n"
         f"🌐 <b>Source:</b> {anime['site']}\n"
-        f"🗣 <b>Language:</b> {anime.get('language', 'Unknown')}\n\n"
-        f"⏳ Fetching episodes...",
+        f"🗣 <b>Language:</b> {anime['language']}\n"
+        f"📺 <b>Type:</b> {anime.get('type', 'Unknown')}\n\n"
+        f"⏳ <i>Fetching episodes...</i>",
         disable_web_page_preview=True
     )
     
-    # Get episodes
-    episodes = await get_episodes(anime['url'], anime['site'])
+    # Get episodes based on site
+    if anime['site'] == 'DesiDubAnime':
+        episodes = await get_episodes_desidubanime(anime['url'])
+    elif anime['site'] == 'AnimeSalt':
+        episodes = await get_episodes_animesalt(anime['url'])
+    else:
+        # Generic method for other sites
+        episodes = await get_episodes_desidubanime(anime['url'])
     
     if not episodes:
         return await callback.message.edit_text(
-            "❌ No episodes found or site is protected.\n\n"
-            "Try direct link access or different source."
+            f"❌ <b>No episodes found!</b>\n\n"
+            f"🎬 <b>{anime['title']}</b>\n"
+            f"🌐 <b>Source:</b> {anime['site']}\n\n"
+            f"💡 <b>Possible reasons:</b>\n"
+            f"• Site structure changed\n"
+            f"• Cloudflare protection active\n"
+            f"• Anime page has different layout\n\n"
+            f"🔗 <b>Direct Link:</b> {anime['url']}",
+            disable_web_page_preview=True
         )
     
-    # Store episodes
-    app.episodes_data = getattr(app, 'episodes_data', {})
-    app.episodes_data[callback.message.id] = {
-        'anime': anime,
-        'episodes': episodes
-    }
+    # Store episodes in session
+    session['current_anime'] = anime
+    session['episodes'] = episodes
     
     text = f"🎬 <b>{anime['title']}</b>\n\n"
     text += f"📺 <b>Total Episodes:</b> {len(episodes)}\n"
-    text += f"🌐 <b>Source:</b> {anime['site']}\n\n"
-    text += "Select option:"
+    text += f"🌐 <b>Source:</b> {anime['site']}\n"
+    text += f"🗣 <b>Language:</b> {anime['language']}\n\n"
+    text += "<b>Choose an option:</b>"
     
     keyboard = [
-        [InlineKeyboardButton("📥 Download All Episodes", callback_data=f"dlall_{callback.message.id}")],
-        [InlineKeyboardButton("📋 Select Specific Episode", callback_data=f"epmenu_{callback.message.id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data=f"back_search_{msg_id}")]
+        [InlineKeyboardButton("📥 Download All Episodes", callback_data=f"dlall_{user_id}")],
+        [InlineKeyboardButton("📋 Select Specific Episode", callback_data=f"epmenu_{user_id}")],
+        [InlineKeyboardButton("🔙 Back to Results", callback_data=f"back_{user_id}")]
     ]
     
     await callback.message.edit_text(
@@ -520,292 +866,257 @@ async def select_anime_callback(client, callback: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^epmenu_(\d+)$"))
 async def episode_menu_callback(client, callback: CallbackQuery):
-    msg_id = int(callback.matches[0].group(1))
-    data = getattr(app, 'episodes_data', {}).get(msg_id)
+    user_id = int(callback.matches[0].group(1))
     
-    if not data:
+    if user_id != callback.from_user.id:
+        return await callback.answer("❌ Not your session!", show_alert=True)
+    
+    session = user_sessions.get(user_id)
+    if not session or 'episodes' not in session:
         return await callback.answer("❌ Session expired!", show_alert=True)
     
-    episodes = data['episodes']
-    anime = data['anime']
+    anime = session['current_anime']
+    episodes = session['episodes']
     
-    # Create episode buttons (show first 10)
+    # Create episode buttons (5 per row)
     keyboard = []
     row = []
     
-    for i, ep in enumerate(episodes[:20], 1):
+    for i, ep in enumerate(episodes[:50], 1):  # Show first 50
+        btn_text = f"EP {ep['number']}"
         row.append(InlineKeyboardButton(
-            f"EP {ep['number']}",
-            callback_data=f"ep_{msg_id}_{i-1}"
+            btn_text,
+            callback_data=f"ep_{user_id}_{i-1}"
         ))
+        
         if len(row) == 5:
             keyboard.append(row)
             row = []
+    
     if row:
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"back_anime_{msg_id}")])
+    # Add navigation if more than 50
+    if len(episodes) > 50:
+        keyboard.append([InlineKeyboardButton(f"📄 Page 1/{(len(episodes)//50)+1}", callback_data="noop")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"anime_back_{user_id}")])
     
     await callback.message.edit_text(
         f"🎬 <b>{anime['title']}</b>\n\n"
-        f"📺 Select Episode:\n"
-        f"Total: {len(episodes)} episodes",
+        f"📺 <b>Select Episode:</b>\n"
+        f"Total: {len(episodes)} episodes\n\n"
+        f"<i>Click on episode number:</i>",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 @app.on_callback_query(filters.regex(r"^ep_(\d+)_(\d+)$"))
-async def select_episode_callback(client, callback: CallbackQuery):
-    msg_id = int(callback.matches[0].group(1))
+async def episode_selected_callback(client, callback: CallbackQuery):
+    user_id = int(callback.matches[0].group(1))
     ep_idx = int(callback.matches[0].group(2))
     
-    data = getattr(app, 'episodes_data', {}).get(msg_id)
-    if not data:
+    if user_id != callback.from_user.id:
+        return await callback.answer("❌ Not your session!", show_alert=True)
+    
+    session = user_sessions.get(user_id)
+    if not session or 'episodes' not in session:
         return await callback.answer("❌ Session expired!", show_alert=True)
     
-    episode = data['episodes'][ep_idx]
-    anime = data['anime']
+    episodes = session['episodes']
+    if ep_idx >= len(episodes):
+        return await callback.answer("❌ Invalid episode!", show_alert=True)
+    
+    episode = episodes[ep_idx]
+    anime = session['current_anime']
     
     await callback.message.edit_text(
         f"🎬 <b>{anime['title']}</b>\n"
         f"📺 <b>Episode {episode['number']}</b>\n\n"
-        f"⏳ Fetching download links...",
+        f"⏳ <i>Extracting video links...</i>\n"
+        f"<i>This may take 5-10 seconds...</i>",
         disable_web_page_preview=True
     )
     
-    # Get qualities
-    qualities = await get_download_links(episode['url'], anime['site'])
+    # Get video links
+    qualities = await get_video_links(episode['url'], anime['site'])
     
+    if not qualities:
+        return await callback.message.edit_text(
+            f"❌ <b>No video links found!</b>\n\n"
+            f"🎬 <b>{anime['title']}</b> - EP {episode['number']}\n"
+            f"🔗 <b>Episode Page:</b> {episode['url']}\n\n"
+            f"<i>Try visiting the site directly or try another episode.</i>",
+            disable_web_page_preview=True
+        )
+    
+    # Build quality buttons
     keyboard = []
-    for q in qualities:
+    text = f"🎬 <b>{anime['title']}</b>\n"
+    text += f"📺 <b>Episode {episode['number']}</b>\n"
+    text += f"🌐 <b>Source:</b> {anime['site']}\n\n"
+    text += "<b>Available Qualities:</b>\n\n"
+    
+    for i, q in enumerate(qualities[:6], 1):
+        quality_name = q['quality']
+        url = q['url']
+        q_type = q['type']
+        
+        # Shorten URL for display
+        display_url = url[:50] + '...' if len(url) > 50 else url
+        
+        text += f"{i}. <b>{quality_name}</b> ({q_type})\n"
+        text += f"   └─ <code>{display_url}</code>\n\n"
+        
         keyboard.append([InlineKeyboardButton(
-            f"📥 {q['quality']} - {q['size']}",
-            url=q['url']  # Direct link or callback for upload
+            f"📥 {quality_name} - {q_type.upper()}",
+            url=url if url.startswith('http') else "https://" + url
         )])
     
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"epmenu_{msg_id}")])
-    
-    settings = get_settings()
-    caption = settings['caption'].format(
-        title=anime['title'],
-        quality='Multiple',
-        episode=episode['number'],
-        source=anime['site']
-    )
+    keyboard.append([InlineKeyboardButton("🔙 Back to Episodes", callback_data=f"epmenu_{user_id}")])
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data=f"back_{user_id}")])
     
     await callback.message.edit_text(
-        f"🎬 <b>{anime['title']}</b>\n"
-        f"📺 <b>Episode {episode['number']}</b>\n\n"
-        f"{caption}\n\n"
-        f"Select Quality:",
+        text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         disable_web_page_preview=True
     )
 
 @app.on_callback_query(filters.regex(r"^dlall_(\d+)$"))
 async def download_all_callback(client, callback: CallbackQuery):
-    msg_id = int(callback.matches[0].group(1))
-    data = getattr(app, 'episodes_data', {}).get(msg_id)
+    user_id = int(callback.matches[0].group(1))
     
-    if not data:
+    if user_id != callback.from_user.id:
+        return await callback.answer("❌ Not your session!", show_alert=True)
+    
+    session = user_sessions.get(user_id)
+    if not session or 'episodes' not in session:
         return await callback.answer("❌ Session expired!", show_alert=True)
     
-    if not is_admin(callback.from_user.id):
-        return await callback.answer("❌ Only admins can batch download!", show_alert=True)
-    
-    episodes = data['episodes']
-    anime = data['anime']
+    anime = session['current_anime']
+    episodes = session['episodes']
     
     await callback.message.edit_text(
         f"🎬 <b>{anime['title']}</b>\n\n"
-        f"📥 Starting batch download of {len(episodes)} episodes...\n"
-        f"⏳ This may take a while.",
+        f"📥 <b>Batch Download Mode</b>\n"
+        f"📺 Total Episodes: {len(episodes)}\n"
+        f"⏳ <i>Processing... This will take time.</i>\n\n"
+        f"<i>Bot will send first 5 episodes as samples...</i>",
         disable_web_page_preview=True
     )
     
-    # Process episodes
-    settings = get_settings()
-    failed = 0
-    success = 0
-    
-    for i, ep in enumerate(episodes[:5]):  # Limit to 5 for demo
+    # Process first 5 episodes only (to avoid flood)
+    count = 0
+    for ep in episodes[:5]:
         try:
-            qualities = await get_download_links(ep['url'], anime['site'])
+            qualities = await get_video_links(ep['url'], anime['site'])
             if qualities:
-                q = qualities[-1]  # Best quality
+                best_quality = qualities[0]  # Take first available
                 
                 caption = settings['caption'].format(
                     title=anime['title'],
-                    quality=q['quality'],
                     episode=ep['number'],
-                    source=anime['site']
+                    source=anime['site'],
+                    quality=best_quality['quality']
                 )
                 
-                # Send as document or video link
                 await callback.message.reply_text(
                     f"📤 <b>Episode {ep['number']}</b>\n\n"
-                    f"🔗 <b>Link:</b> {q['url']}\n\n"
+                    f"🔗 <b>Link:</b> <code>{best_quality['url']}</code>\n\n"
                     f"{caption}",
                     disable_web_page_preview=True
                 )
-                success += 1
-                await asyncio.sleep(2)  # Rate limit
+                count += 1
+                await asyncio.sleep(2)  # Anti-flood
         except Exception as e:
-            failed += 1
-            logger.error(f"Failed to process ep {ep['number']}: {e}")
+            logger.error(f"Batch download error for EP {ep['number']}: {e}")
     
     await callback.message.reply_text(
-        f"✅ <b>Batch Download Complete!</b>\n\n"
-        f"📥 Success: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"⏭ Skipped: {len(episodes) - success - failed}"
+        f"✅ <b>Batch Complete!</b>\n\n"
+        f"📥 Sent: {count}/{min(5, len(episodes))} episodes\n"
+        f"📦 Remaining: {len(episodes) - count} episodes\n\n"
+        f"<i>Use /search again for specific episodes.</i>"
     )
 
-# Admin Commands
-@app.on_message(filters.command("addadmin") & filters.user(Config.ADMIN_IDS))
-async def add_admin_handler(client, message: Message):
-    if len(message.command) != 2:
-        return await message.reply_text("Usage: `/addadmin <user_id>`")
+@app.on_callback_query(filters.regex(r"^back_(\d+)$"))
+async def back_to_results_callback(client, callback: CallbackQuery):
+    user_id = int(callback.matches[0].group(1))
     
-    try:
-        new_admin_id = int(message.command[1])
-        if admins_col.find_one({"user_id": new_admin_id}):
-            return await message.reply_text("❌ User is already an admin!")
-        
-        admins_col.insert_one({
-            "user_id": new_admin_id,
-            "added_by": message.from_user.id,
-            "added_at": datetime.now()
-        })
-        
-        await message.reply_text(f"✅ Added `{new_admin_id}` as admin!")
-    except ValueError:
-        await message.reply_text("❌ Invalid user ID!")
+    if user_id != callback.from_user.id:
+        return await callback.answer("❌ Not your session!", show_alert=True)
+    
+    session = user_sessions.get(user_id)
+    if not session:
+        return await callback.answer("❌ Session expired!", show_alert=True)
+    
+    # Re-display results
+    await display_results(callback.message, session['results'], session['query'], f"{user_id}:{session['query']}")
 
-@app.on_message(filters.command("deladmin") & filters.user(Config.ADMIN_IDS))
-async def del_admin_handler(client, message: Message):
-    if len(message.command) != 2:
-        return await message.reply_text("Usage: `/deladmin <user_id>`")
-    
-    try:
-        admin_id = int(message.command[1])
-        if admin_id in Config.ADMIN_IDS:
-            return await message.reply_text("❌ Cannot remove primary admin!")
-        
-        result = admins_col.delete_one({"user_id": admin_id})
-        if result.deleted_count:
-            await message.reply_text(f"✅ Removed admin `{admin_id}`")
-        else:
-            await message.reply_text("❌ User is not an admin!")
-    except ValueError:
-        await message.reply_text("❌ Invalid user ID!")
+@app.on_callback_query(filters.regex(r"^anime_back_(\d+)$"))
+async def back_to_anime_callback(client, callback: CallbackQuery):
+    user_id = int(callback.matches[0].group(1))
+    await callback.message.edit_text("⏳ Going back...")
+    # Trigger anime selection again
+    fake_callback = type('obj', (object,), {
+        'from_user': type('obj', (object,), {'id': user_id})(),
+        'message': callback.message,
+        'matches': [[None, str(user_id), '0']]  # Default to first anime
+    })
+    await anime_selected_callback(client, fake_callback)
 
-@app.on_message(filters.command("admins"))
-async def list_admins_handler(client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply_text("❌ Admin only!")
+@app.on_callback_query(filters.regex(r"^refresh_(.+)$"))
+async def refresh_callback(client, callback: CallbackQuery):
+    cache_key = callback.matches[0].group(1)
     
-    text = "👥 <b>Admin List</b>\n\n"
-    text += "<b>Primary Admins:</b>\n"
-    for admin_id in Config.ADMIN_IDS:
-        text += f"• `{admin_id}`\n"
+    # Remove from cache
+    if cache_key in search_cache:
+        del search_cache[cache_key]
     
-    text += "\n<b>Added Admins:</b>\n"
-    admins = list(admins_col.find())
-    if admins:
-        for admin in admins:
-            text += f"• `{admin['user_id']}` (Added by {admin['added_by']})\n"
+    await callback.answer("🔄 Cache cleared! Search again with /search", show_alert=True)
+    await callback.message.delete()
+
+@app.on_callback_query(filters.regex(r"^cancel_(\d+)$"))
+async def cancel_callback(client, callback: CallbackQuery):
+    user_id = int(callback.matches[0].group(1))
+    if user_id == callback.from_user.id:
+        await callback.message.edit_text("❌ <b>Search cancelled!</b>\n\nUse /search to start again.")
     else:
-        text += "None\n"
-    
-    await message.reply_text(text)
+        await callback.answer("❌ Not your search!", show_alert=True)
 
-@app.on_message(filters.command("setcaption") & filters.user(Config.ADMIN_IDS))
-async def set_caption_handler(client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "Usage: `/setcaption <text>`\n\n"
-            "Variables: {title}, {quality}, {episode}, {source}"
-        )
-    
-    caption = " ".join(message.command[1:])
-    settings_col.update_one(
-        {"_id": "global"},
-        {"$set": {"caption": caption}},
-        upsert=True
-    )
-    
-    await message.reply_text(f"✅ Caption updated!\n\nPreview:\n{caption}")
+@app.on_callback_query(filters.regex(r"^noop$"))
+async def noop_callback(client, callback: CallbackQuery):
+    await callback.answer("Navigation button", show_alert=False)
 
-@app.on_message(filters.command("setthumbnail") & filters.user(Config.ADMIN_IDS))
-async def set_thumbnail_handler(client, message: Message):
-    if not message.reply_to_message or not message.reply_to_message.photo:
-        return await message.reply_text("❌ Reply to a photo with this command!")
-    
-    photo = message.reply_to_message.photo.file_id
-    settings_col.update_one(
-        {"_id": "global"},
-        {"$set": {"thumbnail": photo}},
-        upsert=True
+# Admin commands
+@app.on_message(filters.command("admin") & filters.user(Config.ADMIN_IDS))
+async def admin_handler(client, message: Message):
+    await message.reply_text(
+        "👑 <b>Admin Panel</b>\n\n"
+        "Commands:\n"
+        "/stats - Bot statistics\n"
+        "/broadcast - Send message to all users\n"
+        "/setcaption - Set default caption\n"
+        "/cache - Clear search cache\n\n"
+        f"Current Cache: {len(search_cache)} searches\n"
+        f"Active Sessions: {len(user_sessions)} users"
     )
-    
-    await message.reply_text("✅ Thumbnail updated!")
-
-@app.on_message(filters.command("setfilename") & filters.user(Config.ADMIN_IDS))
-async def set_filename_handler(client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "Usage: `/setfilename <template>`\n\n"
-            "Example: {{title}}_EP{{ep}}_{{quality}}\n"
-            "Variables: {title}, {ep}, {quality}"
-        )
-    
-    template = " ".join(message.command[1:])
-    settings_col.update_one(
-        {"_id": "global"},
-        {"$set": {"filename_template": template}},
-        upsert=True
-    )
-    
-    await message.reply_text(f"✅ Filename template updated!\n\nTemplate: `{template}`")
 
 @app.on_message(filters.command("stats") & filters.user(Config.ADMIN_IDS))
 async def stats_handler(client, message: Message):
-    total_users = users_col.count_documents({})
-    total_admins = len(Config.ADMIN_IDS) + admins_col.count_documents({})
-    
-    text = f"""
-📊 <b>Bot Statistics</b>
+    await message.reply_text(
+        f"📊 <b>Bot Statistics</b>\n\n"
+        f"🔍 Cached Searches: {len(search_cache)}\n"
+        f"👥 Active Sessions: {len(user_sessions)}\n"
+        f"⏱ Uptime: Running\n"
+        f"🌐 Sites: {len(Config.SITES)} configured"
+    )
 
-👥 <b>Total Users:</b> {total_users}
-👮 <b>Total Admins:</b> {total_admins}
-📅 <b>Started:</b> {datetime.now().strftime('%Y-%m-%d')}
-    """
-    await message.reply_text(text)
-
-@app.on_callback_query(filters.regex(r"^cancel_search$"))
-async def cancel_callback(client, callback: CallbackQuery):
-    await callback.message.edit_text("❌ Search cancelled!")
-
-@app.on_callback_query(filters.regex(r"^back_search_(\d+)$"))
-async def back_search_callback(client, callback: CallbackQuery):
-    await search_handler(client, callback.message.reply_to_message or callback.message)
-
-@app.on_callback_query(filters.regex(r"^back_anime_(\d+)$"))
-async def back_anime_callback(client, callback: CallbackQuery):
-    msg_id = int(callback.matches[0].group(1))
-    data = getattr(app, 'episodes_data', {}).get(msg_id)
-    
-    if data:
-        anime = data['anime']
-        keyboard = [
-            [InlineKeyboardButton("📥 Download All", callback_data=f"dlall_{msg_id}")],
-            [InlineKeyboardButton("📋 Select Episode", callback_data=f"epmenu_{msg_id}")]
-        ]
-        await callback.message.edit_text(
-            f"🎬 <b>{anime['title']}</b>\n\nSelect option:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+@app.on_message(filters.command("cache") & filters.user(Config.ADMIN_IDS))
+async def clear_cache_handler(client, message: Message):
+    search_cache.clear()
+    user_sessions.clear()
+    await message.reply_text("✅ <b>Cache cleared!</b>")
 
 if __name__ == "__main__":
-    logger.info("Starting Anime Scraper Bot...")
+    logger.info("🚀 Starting Anime Scraper Bot...")
+    logger.info(f"📡 Configured Sites: {list(Config.SITES.keys())}")
     app.run()
